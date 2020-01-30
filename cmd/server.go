@@ -21,8 +21,10 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/prometheus/alertmanager/notify"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -47,6 +49,8 @@ By using a --config file, you will be able to define multiple prometheus request
 This is an example config file content in YAML format.
 
 ---
+label: msteams_connector
+fallback: channel_1
 connectors:
 - channel_1: https://outlook.office.com/webhook/xxxx/hook/for/channel1
 - channel_2: https://outlook.office.com/webhook/xxxx/hook/for/channel2
@@ -67,13 +71,20 @@ var (
 	markdownEnabled     bool
 	idleConnTimeout     time.Duration
 	tlsHandshakeTimeout time.Duration
+	connectorLabel		string
+	fallbackConnector	string
+	useLabel            bool
 )
 
 // TeamsConfig is the struct for config files
 // The Connectors key is the request path for Prometheus to post
 // The Connectors value is the Teams webhook url
+// The ConnectorLabel is the alert's commonLabels key for the connector
+// The FallbackConnector is the connector to use if the ConnectorLabel is not set
 type TeamsConfig struct {
 	Connectors []map[string]string `yaml:"connectors"`
+	ConnectorLabel string `yaml:"label"`
+	FallbackConnector string `yaml:"fallback"`
 }
 
 func init() {
@@ -102,6 +113,10 @@ func init() {
 		"The idle connection timeout (in seconds)")
 	serverCmd.Flags().DurationVar(&tlsHandshakeTimeout, "tls-handshake-timeout", 30*time.Second,
 		"The TLS handshake timeout (in seconds)")
+	serverCmd.Flags().StringVar(&connectorLabel, "connector-label", "",
+		"The alert label to use for the connector information (e.g. 'msteams_connector').")
+	serverCmd.Flags().StringVar(&fallbackConnector, "fallback-connector", "",
+		"The connector to use if an alert contains no connector label (e.g 'alertmanager').")
 
 	// NOTE: Can we use viper for this?
 	// This is placed to support people who still depends
@@ -118,6 +133,14 @@ func init() {
 	if v, ok := os.LookupEnv("TEMPLATE_FILE"); ok {
 		templateFile = v
 	}
+	if v, ok := os.LookupEnv("CONNECTOR_LABEL"); ok {
+		connectorLabel = v
+	}
+	if v, ok := os.LookupEnv("FALLBACK_CONNECTOR"); ok {
+		fallbackConnector = v
+	}
+
+	useLabel = false
 }
 
 func setLogLevel(l string) {
@@ -195,6 +218,20 @@ func server(cmd *cobra.Command, args []string) {
 		teamsCfg.Connectors = append(teamsCfg.Connectors, cfgFromFlags)
 	}
 
+	// Use connector label from config if not set from flags
+	if connectorLabel == "" && len(teamsCfg.ConnectorLabel) != 0 {
+		connectorLabel = teamsCfg.ConnectorLabel
+	}
+	// Use fallback connector from config if not set from flags
+	if fallbackConnector == "" && len(teamsCfg.FallbackConnector) != 0 {
+		fallbackConnector = teamsCfg.FallbackConnector
+	}
+	if connectorLabel != "" && fallbackConnector != "" {
+		log.Infof("Using the alert label %q for connector selection", connectorLabel)
+		log.Infof("Using the connector %q if the connector label is missing", fallbackConnector)
+		useLabel = true
+	}
+
 	mux := http.NewServeMux()
 	for _, teamMap := range teamsCfg.Connectors {
 		for uri, webhook := range teamMap {
@@ -205,7 +242,7 @@ func server(cmd *cobra.Command, args []string) {
 	mux.Handle("/metrics", promhttp.Handler())
 	server := serverListenAddress + ":" + strconv.Itoa(serverPort)
 	log.Infof("prometheus-msteams server started listening at %s", server)
-	log.Fatal(http.ListenAndServe(server, mux))
+	log.Fatal(http.ListenAndServe(server, &LabelHandler{mux}))
 }
 
 func addPrometheusHandler(uri string, webhook string, template *template.Template, mux *http.ServeMux) {
@@ -231,4 +268,48 @@ func (teamsCfg *TeamsConfig) configHandler(w http.ResponseWriter, r *http.Reques
 	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, string(b))
+}
+
+type LabelHandler struct {
+	handler http.Handler
+}
+
+func (l *LabelHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if useLabel && r.RequestURI == "/_by-label" {
+		log.Debug("/_by-label received a request")
+		connector := getConnectorFromLabel(w, r)
+		r.RequestURI = "/"+connector
+		r.URL.Path = "/"+connector
+		log.Debugf("Changed request path to: %s", r.URL.Path)
+	}
+	l.handler.ServeHTTP(w, r)
+}
+
+func getConnectorFromLabel(w http.ResponseWriter, r *http.Request) string {
+	if r.Method != http.MethodPost {
+		errMsg := fmt.Sprintf("Invalid request method: %s, this handler only accepts POST requests", r.Method)
+		log.Error(errMsg)
+		http.Error(w, errMsg, http.StatusMethodNotAllowed)
+		return ""
+	}
+	buf, _ := ioutil.ReadAll(r.Body)
+	bodyDecode := ioutil.NopCloser(bytes.NewBuffer(buf))
+	bodyBackup := ioutil.NopCloser(bytes.NewBuffer(buf))
+	var promAlert notify.WebhookMessage
+	if err := json.NewDecoder(bodyDecode).Decode(&promAlert); err != nil {
+		errMsg := fmt.Sprintf("LabelHandler failed to decode Prometheus alert message: %v", err)
+		log.Error(errMsg)
+		http.Error(w, errMsg, http.StatusInternalServerError)
+		return ""
+	}
+	r.Body = bodyBackup
+	connector := fallbackConnector
+	if labelConnector, err := promAlert.CommonLabels[connectorLabel]; err {
+		log.Debugf("Connector label found, using label value: %s", labelConnector)
+		connector = labelConnector
+	} else {
+		log.Debugf("No Connector label value found, using fallback: %s", fallbackConnector)
+	}
+	log.Debugf("Returning connector: %s", connector)
+	return connector
 }
